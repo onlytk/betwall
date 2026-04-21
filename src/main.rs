@@ -14,6 +14,8 @@ mod monitor;
 mod server;
 #[cfg(windows)]
 mod totp;
+#[cfg(windows)]
+mod updater;
 
 #[cfg(windows)]
 fn main() {

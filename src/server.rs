@@ -1,5 +1,6 @@
 use crate::config::{self, SharedConfig};
 use crate::totp;
+use crate::updater;
 use qrcode::render::svg;
 use qrcode::QrCode;
 use std::collections::HashMap;
@@ -15,9 +16,14 @@ pub struct ServerState {
     pub stop: Arc<AtomicBool>,
     pub pending_secret: Mutex<Option<String>>,
     pub addr: SocketAddr,
+    pub update_status: updater::SharedStatus,
 }
 
-pub fn start(cfg: SharedConfig, stop: Arc<AtomicBool>) -> Arc<ServerState> {
+pub fn start(
+    cfg: SharedConfig,
+    stop: Arc<AtomicBool>,
+    update_status: updater::SharedStatus,
+) -> Arc<ServerState> {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
     listener
         .set_nonblocking(false)
@@ -28,6 +34,7 @@ pub fn start(cfg: SharedConfig, stop: Arc<AtomicBool>) -> Arc<ServerState> {
         stop: stop.clone(),
         pending_secret: Mutex::new(None),
         addr,
+        update_status,
     });
 
     let st = state.clone();
@@ -196,6 +203,9 @@ fn handle(stream: TcpStream, st: Arc<ServerState>) {
         ("POST", "/quit") => {
             handle_quit(stream, &st, &req.body);
         }
+        ("POST", "/update") => {
+            handle_update(stream, &st, &req.body);
+        }
         _ => {
             respond(stream, 404, "text/plain", "not found");
         }
@@ -219,416 +229,345 @@ fn page(title: &str, body: &str) -> String {
   * {{ box-sizing: border-box; }}
   html, body {{ height: 100%; margin: 0; }}
   body {{
-    font: 13.5px/1.5 ui-sans-serif, -apple-system, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+    font: 13px/1.45 ui-sans-serif, -apple-system, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     font-variant-numeric: tabular-nums;
-    background: #09090b;
-    color: #d8dadf;
-    padding: 36px 20px;
-    display: grid;
-    place-items: start center;
+    background: #0a0a0c;
+    color: #e4e5e9;
+    min-height: 100vh;
   }}
 
-  .panel {{
-    width: 100%;
-    max-width: 460px;
+  .wrap {{
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 24px 20px 140px;
     display: flex;
     flex-direction: column;
     gap: 14px;
   }}
-  .panel > * {{
-    animation: fadeUp 340ms cubic-bezier(0.2, 0, 0, 1) both;
-  }}
-  .panel > *:nth-child(1) {{ animation-delay: 0ms; }}
-  .panel > *:nth-child(2) {{ animation-delay: 70ms; }}
-  .panel > *:nth-child(3) {{ animation-delay: 140ms; }}
-  .panel > *:nth-child(4) {{ animation-delay: 210ms; }}
-  .panel > *:nth-child(5) {{ animation-delay: 280ms; }}
 
-  @keyframes fadeUp {{
-    from {{ opacity: 0; transform: translateY(4px); }}
-    to   {{ opacity: 1; transform: translateY(0); }}
-  }}
+  h1 {{ margin: 0; font: 600 17px/1.2 inherit; letter-spacing: -0.02em; color: #f4f5f7; }}
+  h2 {{ margin: 0; font: 600 11px/1 inherit; letter-spacing: 0.08em; color: #7a7e87; text-transform: uppercase; }}
+  p  {{ margin: 4px 0 0; color: #8a8e97; font-size: 12.5px; }}
 
-  h1 {{
-    margin: 0;
-    font-size: 15px;
-    font-weight: 600;
-    letter-spacing: -0.015em;
-    color: #f2f3f5;
-    text-wrap: balance;
+  /* Header */
+  .hero {{
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 16px;
+    padding: 18px 20px;
+    background: linear-gradient(180deg, #15161b 0%, #101116 100%);
+    border-radius: 14px;
+    box-shadow:
+      0 0 0 1px rgba(255,255,255,0.05),
+      0 1px 2px rgba(0,0,0,0.4),
+      0 12px 32px rgba(0,0,0,0.35);
   }}
-  p {{
-    margin: 4px 0 0;
-    color: #8a8e97;
+  .hero .info .sub {{ color: #9095a0; font-size: 12px; margin-top: 3px; display: flex; gap: 8px; align-items: center; }}
+  .hero .info .sub b {{ color: #e4e5e9; font-weight: 600; }}
+  .hero .ver {{ font: 11px ui-monospace, "SF Mono", Consolas, monospace; color: #595d65; margin-left: 6px; }}
+
+  .status {{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    font: 600 10.5px/1 inherit;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }}
+  .status.on  {{ background: rgba(239, 68, 68, 0.14); color: #fca5a5; box-shadow: inset 0 0 0 1px rgba(239,68,68,0.25); }}
+  .status.off {{ background: rgba(255,255,255,0.05); color: #7a7e87; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08); }}
+  .status .dot {{ width: 6px; height: 6px; border-radius: 50%; background: currentColor; }}
+
+  /* Toggle switches */
+  .switch {{ position: relative; width: 40px; height: 24px; flex-shrink: 0; cursor: pointer; display: block; }}
+  .switch::before {{ content: ""; position: absolute; inset: -8px; }}
+  .switch input {{ position: absolute; opacity: 0; width: 0; height: 0; }}
+  .switch .track {{
+    position: absolute; inset: 0;
+    background: #25272d;
+    border-radius: 999px;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06);
+    transition: background 180ms cubic-bezier(0.2, 0, 0, 1);
+  }}
+  .switch .thumb {{
+    position: absolute; top: 2px; left: 2px;
+    width: 20px; height: 20px;
+    background: #f4f5f7;
+    border-radius: 50%;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.4), 0 0 0 0.5px rgba(0,0,0,0.3);
+    transition: translate 180ms cubic-bezier(0.2, 0, 0, 1);
+  }}
+  .switch input:checked + .track {{ background: #ef4444; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.1); }}
+  .switch input:checked + .track .thumb {{ translate: 16px 0; }}
+
+  .switch.sm {{ width: 30px; height: 18px; }}
+  .switch.sm .thumb {{ width: 14px; height: 14px; }}
+  .switch.sm input:checked + .track .thumb {{ translate: 12px 0; }}
+
+  /* Banners */
+  .banner {{
+    padding: 11px 14px;
+    border-radius: 10px;
     font-size: 12.5px;
-    text-wrap: pretty;
-  }}
-
-  .head {{
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
   }}
-  .head .info {{ min-width: 0; }}
-  .head .info .sub {{ font-size: 12px; color: #8a8e97; margin-top: 2px; }}
-  .head .info .sub b {{ color: #d8dadf; font-weight: 500; }}
+  .banner.ok  {{ background: rgba(74,222,128,0.08); color: #8fd79e; box-shadow: inset 0 0 0 1px rgba(74,222,128,0.15); }}
+  .banner.err {{ background: rgba(239,68,68,0.1); color: #f4a5a5; box-shadow: inset 0 0 0 1px rgba(239,68,68,0.2); }}
+  .banner.info {{ background: rgba(99,179,237,0.08); color: #a5c9f5; box-shadow: inset 0 0 0 1px rgba(99,179,237,0.2); }}
 
-  .switch {{
-    position: relative;
-    width: 36px;
-    height: 22px;
-    flex-shrink: 0;
-    cursor: pointer;
-    display: block;
-  }}
-  .switch::before {{
-    content: "";
-    position: absolute;
-    inset: -9px;
-  }}
-  .switch input {{ position: absolute; opacity: 0; width: 0; height: 0; }}
-  .switch .track {{
-    position: absolute;
-    inset: 0;
-    background: #2a2d34;
-    border-radius: 999px;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
-    transition-property: background-color, box-shadow;
-    transition-duration: 180ms;
-    transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
-  }}
-  .switch .thumb {{
-    position: absolute;
-    top: 2px; left: 2px;
-    width: 18px; height: 18px;
-    background: #f4f5f7;
-    border-radius: 50%;
-    box-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.35),
-      0 0 0 0.5px rgba(0, 0, 0, 0.25);
-    transition-property: translate, background-color;
-    transition-duration: 180ms;
-    transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
-  }}
-  .switch input:checked + .track {{
-    background: #ef4444;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
-  }}
-  .switch input:checked + .track .thumb {{
-    translate: 14px 0;
-    background: #fff;
-  }}
-
-  .list {{
-    background: #131418;
-    border-radius: 12px;
-    overflow: hidden;
-    box-shadow:
-      0 0 0 1px rgba(255, 255, 255, 0.04),
-      0 1px 2px rgba(0, 0, 0, 0.3),
-      0 8px 24px rgba(0, 0, 0, 0.2);
-  }}
-  .list .row {{
-    display: flex;
-    align-items: stretch;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-  }}
-  .list .row:last-child {{ border-bottom: none; }}
-  .list .toggle {{
-    flex: 1;
-    min-width: 0;
+  /* Casino grid */
+  .casinos {{
     display: grid;
-    grid-template-columns: 16px 1fr auto;
-    gap: 12px;
-    align-items: center;
-    padding: 11px 14px;
-    cursor: pointer;
-    transition-property: background-color;
-    transition-duration: 120ms;
-    transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
-  }}
-  .list .toggle:hover {{ background: rgba(255, 255, 255, 0.025); }}
-  .list .remove {{
-    appearance: none;
-    border: 0;
-    background: transparent;
-    color: #5f636d;
-    cursor: pointer;
-    font: 500 18px/1 ui-sans-serif, system-ui, sans-serif;
-    padding: 0 14px;
-    border-radius: 0;
-    box-shadow: none;
-    transition-property: color, background-color;
-    transition-duration: 140ms;
-    transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
-  }}
-  .list .remove:hover {{ color: #f4a5a5; background: rgba(239, 68, 68, 0.08); }}
-  .list .empty {{
-    padding: 22px 14px;
-    text-align: center;
-    color: #5f636d;
-    font-size: 12.5px;
-  }}
-  .list input[type=checkbox] {{
-    width: 16px; height: 16px;
-    margin: 0;
-    accent-color: #ef4444;
-    cursor: pointer;
-  }}
-  .list .name {{
-    color: #d8dadf;
-    font-weight: 500;
-    font-size: 13px;
-    text-wrap: pretty;
-  }}
-  .list .slug {{
-    font-family: ui-monospace, "SF Mono", Consolas, monospace;
-    font-size: 11px;
-    color: #5f636d;
-  }}
-
-  .actions {{
-    display: grid;
-    grid-template-columns: 1fr auto auto;
+    grid-template-columns: 1fr;
     gap: 8px;
   }}
-
-  .casinos {{
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
+  @media (min-width: 680px) {{
+    .casinos {{ grid-template-columns: 1fr 1fr; align-items: start; }}
+    .casinos > details[open] {{ grid-column: span 2; }}
   }}
-  .casino {{
-    background: #131418;
-    border-radius: 10px;
+
+  details.card {{
+    background: #121317;
+    border-radius: 11px;
     overflow: hidden;
     box-shadow:
-      0 0 0 1px rgba(255, 255, 255, 0.04),
-      0 1px 2px rgba(0, 0, 0, 0.25);
+      0 0 0 1px rgba(255,255,255,0.04),
+      0 1px 2px rgba(0,0,0,0.25);
+    transition: box-shadow 180ms cubic-bezier(0.2, 0, 0, 1);
   }}
-  .casino > summary {{
+  details.card[open] {{
+    box-shadow:
+      0 0 0 1px rgba(255,255,255,0.08),
+      0 8px 24px rgba(0,0,0,0.3);
+  }}
+  details.card > summary {{
     list-style: none;
-    padding: 10px 14px;
     display: grid;
-    grid-template-columns: 14px 1fr auto auto auto;
+    grid-template-columns: 1fr auto 14px;
     align-items: center;
     gap: 10px;
+    padding: 10px 14px;
     cursor: pointer;
     user-select: none;
+    transition: background 120ms;
   }}
-  .casino > summary::-webkit-details-marker {{ display: none; }}
-  .casino > summary .chev {{
-    color: #5f636d;
-    font-size: 10px;
-    transition: transform 180ms cubic-bezier(0.2, 0, 0, 1);
-  }}
-  .casino[open] > summary .chev {{ transform: rotate(90deg); }}
-  .casino .cname {{ color: #d8dadf; font-weight: 600; font-size: 13px; }}
-  .casino .domain {{
-    font-family: ui-monospace, "SF Mono", Consolas, monospace;
-    font-size: 11px;
-    color: #5f636d;
-    padding-left: 2px;
-  }}
-  .casino .count {{
-    font-size: 11px;
-    color: #8a8e97;
-    padding: 2px 8px;
-    background: rgba(255, 255, 255, 0.04);
+  details.card > summary::-webkit-details-marker {{ display: none; }}
+  details.card > summary:hover {{ background: rgba(255,255,255,0.02); }}
+  details.card .title {{ min-width: 0; display: flex; align-items: baseline; gap: 8px; }}
+  details.card .cname {{ font-weight: 600; font-size: 13px; color: #e4e5e9; }}
+  details.card .domain {{ font: 11px ui-monospace, "SF Mono", Consolas, monospace; color: #595d65; }}
+  details.card .chev {{ color: #595d65; font-size: 10px; transition: transform 180ms; text-align: right; }}
+  details.card[open] .chev {{ transform: rotate(90deg); }}
+
+  /* State pill — tells you exactly what's blocked */
+  .pill {{
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 8px;
     border-radius: 999px;
+    font: 600 10.5px/1 inherit;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
   }}
-  .casino > summary:hover {{ background: rgba(255, 255, 255, 0.02); }}
-  .casino .list {{ border-top: 1px solid rgba(255, 255, 255, 0.04); border-radius: 0; box-shadow: none; }}
+  .pill .pdot {{ width: 5px; height: 5px; border-radius: 50%; background: currentColor; }}
+  .pill.none {{ background: rgba(255,255,255,0.04); color: #6e7280; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.05); }}
+  .pill.some {{ background: rgba(245,158,11,0.1); color: #fbbf24; box-shadow: inset 0 0 0 1px rgba(245,158,11,0.2); }}
+  .pill.all  {{ background: rgba(239,68,68,0.12); color: #fca5a5; box-shadow: inset 0 0 0 1px rgba(239,68,68,0.25); }}
 
-  .allswitch {{
-    position: relative;
-    width: 30px;
-    height: 18px;
-    flex-shrink: 0;
-    cursor: pointer;
-    display: block;
+  /* Expanded card body */
+  .card-body {{
+    border-top: 1px solid rgba(255,255,255,0.05);
+    background: #0f1014;
   }}
-  .allswitch input {{ position: absolute; opacity: 0; width: 0; height: 0; }}
-  .allswitch .track {{
-    position: absolute;
-    inset: 0;
-    background: #2a2d34;
-    border-radius: 999px;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
-    transition: background-color 180ms cubic-bezier(0.2, 0, 0, 1);
+  .blockall {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 14px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
   }}
-  .allswitch .thumb {{
-    position: absolute;
-    top: 2px; left: 2px;
-    width: 14px; height: 14px;
-    background: #f4f5f7;
-    border-radius: 50%;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
-    transition: translate 180ms cubic-bezier(0.2, 0, 0, 1);
-  }}
-  .allswitch input:checked + .track {{ background: #ef4444; }}
-  .allswitch input:checked + .track .thumb {{ translate: 12px 0; background: #fff; }}
+  .blockall .lbl b {{ display: block; font-weight: 600; color: #e4e5e9; font-size: 12.5px; }}
+  .blockall .lbl span {{ color: #7a7e87; font-size: 11.5px; display: block; margin-top: 1px; }}
 
-  .row.muted .toggle {{ opacity: 0.4; cursor: not-allowed; }}
-  .row.muted input[type=checkbox] {{ cursor: not-allowed; }}
-
-  .add {{
+  .games {{ display: flex; flex-direction: column; }}
+  .game {{
     display: grid;
-    grid-template-columns: auto 1fr 1.2fr auto;
+    grid-template-columns: 18px 1fr auto auto;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+  }}
+  .game:last-child {{ border-bottom: none; }}
+  .game label {{ display: contents; cursor: pointer; }}
+  .game input[type=checkbox] {{ width: 16px; height: 16px; accent-color: #ef4444; margin: 0; cursor: pointer; }}
+  .game .name  {{ font-weight: 500; color: #e4e5e9; font-size: 12.5px; }}
+  .game .slug  {{ font: 11px ui-monospace, "SF Mono", Consolas, monospace; color: #595d65; }}
+  .game .rm {{
+    appearance: none; border: 0; background: transparent;
+    color: #4a4e57; cursor: pointer;
+    font: 500 16px/1 inherit; padding: 4px 8px; border-radius: 6px;
+    transition: color 120ms, background 120ms;
+  }}
+  .game .rm:hover {{ color: #f4a5a5; background: rgba(239,68,68,0.08); }}
+  .game.muted {{ opacity: 0.35; }}
+  .game.muted input[type=checkbox] {{ pointer-events: none; }}
+  .empty {{ padding: 18px 14px; text-align: center; color: #595d65; font-size: 12px; }}
+
+  /* Add-game form */
+  .addbox {{
+    background: #121317;
+    border-radius: 11px;
+    padding: 14px;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.04), 0 1px 2px rgba(0,0,0,0.25);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }}
+  .addbox .row {{
+    display: grid;
+    grid-template-columns: 180px 1fr 1.3fr auto;
     gap: 8px;
   }}
-  .select {{
-    padding: 10px 12px;
-    background: #0b0c0f;
+  @media (max-width: 520px) {{
+    .addbox .row {{ grid-template-columns: 1fr 1fr; }}
+  }}
+
+  .input, .select {{
+    padding: 9px 12px;
+    background: #0a0b0e;
     border: 0;
     border-radius: 8px;
     color: #ededef;
-    font: 13px ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+    font: 13px inherit;
     outline: none;
-    cursor: pointer;
+    min-width: 0;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06), inset 0 1px 2px rgba(0,0,0,0.4);
+    transition: box-shadow 160ms;
+  }}
+  .input::placeholder {{ color: #4a4e57; }}
+  .input:focus, .select:focus {{ box-shadow: inset 0 0 0 1px rgba(239,68,68,0.7), 0 0 0 3px rgba(239,68,68,0.14); }}
+  .select {{
     appearance: none;
-    padding-right: 28px;
+    cursor: pointer;
+    padding-right: 30px;
     background-image: linear-gradient(45deg, transparent 50%, #8a8e97 50%), linear-gradient(135deg, #8a8e97 50%, transparent 50%);
     background-position: calc(100% - 14px) 50%, calc(100% - 10px) 50%;
     background-size: 4px 4px, 4px 4px;
     background-repeat: no-repeat;
-    box-shadow:
-      inset 0 0 0 1px rgba(255, 255, 255, 0.06),
-      inset 0 1px 2px rgba(0, 0, 0, 0.4);
-  }}
-  .add input {{
-    padding: 10px 12px;
-    background: #0b0c0f;
-    border: 0;
-    border-radius: 8px;
-    color: #ededef;
-    font: 13px ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
-    outline: none;
-    min-width: 0;
-    box-shadow:
-      inset 0 0 0 1px rgba(255, 255, 255, 0.06),
-      inset 0 1px 2px rgba(0, 0, 0, 0.4);
-    transition-property: box-shadow;
-    transition-duration: 160ms;
-    transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
-  }}
-  .add input::placeholder {{ color: #4a4e57; }}
-  .add input:focus {{
-    box-shadow:
-      inset 0 0 0 1px rgba(239, 68, 68, 0.7),
-      0 0 0 3px rgba(239, 68, 68, 0.14);
+    background-color: #0a0b0e;
   }}
 
-  .code {{
+  /* Buttons */
+  button, .btn {{
+    appearance: none; border: 0; cursor: pointer;
+    padding: 9px 16px;
+    background: #ef4444;
+    color: #fff;
+    border-radius: 8px;
+    font: 600 12.5px/1 inherit;
+    white-space: nowrap;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.08), 0 1px 2px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.12);
+    transition: scale 140ms, background 140ms, color 140ms, box-shadow 140ms;
+  }}
+  button:hover {{ background: #f05a5a; }}
+  button:active {{ scale: 0.96; }}
+  button:focus-visible {{ outline: 2px solid rgba(239,68,68,0.5); outline-offset: 2px; }}
+  button.ghost {{
+    background: transparent; color: #9095a0;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08);
+  }}
+  button.ghost:hover {{ color: #e4e5e9; background: rgba(255,255,255,0.03); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.14); }}
+  button.warn {{
+    background: transparent; color: #fbbf24;
+    box-shadow: inset 0 0 0 1px rgba(245,158,11,0.3);
+  }}
+  button.warn:hover {{ background: rgba(245,158,11,0.1); color: #fcd34d; }}
+
+  /* Sticky action bar */
+  .dock {{
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    padding: 12px 20px calc(12px + env(safe-area-inset-bottom));
+    background: linear-gradient(180deg, rgba(10,10,12,0) 0%, rgba(10,10,12,0.92) 35%);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    z-index: 10;
+    pointer-events: none;
+  }}
+  .dock-inner {{
+    max-width: 820px;
+    margin: 0 auto;
+    background: #15161b;
+    border-radius: 14px;
     padding: 10px 12px;
-    background: #0b0c0f;
+    display: grid;
+    grid-template-columns: 1fr auto auto auto;
+    gap: 8px;
+    align-items: center;
+    box-shadow:
+      0 0 0 1px rgba(255,255,255,0.07),
+      0 12px 28px rgba(0,0,0,0.5);
+    pointer-events: auto;
+  }}
+  .dock .hint {{ color: #6e7280; font-size: 11px; padding-left: 6px; line-height: 1.3; }}
+
+  .code {{
+    padding: 9px 12px;
+    background: #0a0b0e;
     border: 0;
     border-radius: 8px;
     color: #ededef;
     font: 500 14px/1 ui-monospace, "SF Mono", Consolas, monospace;
-    letter-spacing: 0.32em;
+    letter-spacing: 0.28em;
     text-align: center;
     outline: none;
-    box-shadow:
-      inset 0 0 0 1px rgba(255, 255, 255, 0.06),
-      inset 0 1px 2px rgba(0, 0, 0, 0.4);
-    transition-property: box-shadow;
-    transition-duration: 160ms;
-    transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+    width: 110px;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06), inset 0 1px 2px rgba(0,0,0,0.4);
+    transition: box-shadow 160ms;
   }}
   .code::placeholder {{ color: #4a4e57; letter-spacing: 0.2em; font-weight: 400; }}
-  .code:focus {{
-    box-shadow:
-      inset 0 0 0 1px rgba(239, 68, 68, 0.7),
-      0 0 0 3px rgba(239, 68, 68, 0.14);
-  }}
+  .code:focus {{ box-shadow: inset 0 0 0 1px rgba(239,68,68,0.7), 0 0 0 3px rgba(239,68,68,0.14); }}
 
-  button {{
-    appearance: none;
-    border: 0;
-    padding: 10px 16px;
-    background: #ef4444;
-    color: #fff;
-    border-radius: 8px;
-    font: 600 12.5px/1 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
-    cursor: pointer;
-    white-space: nowrap;
-    box-shadow:
-      0 0 0 1px rgba(255, 255, 255, 0.08),
-      0 1px 2px rgba(0, 0, 0, 0.3),
-      inset 0 1px 0 rgba(255, 255, 255, 0.12);
-    transition-property: scale, background-color, box-shadow;
-    transition-duration: 140ms;
-    transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
-  }}
-  button:hover {{ background: #f05a5a; }}
-  button:active {{ scale: 0.96; }}
-  button:focus-visible {{ outline: 2px solid rgba(239, 68, 68, 0.5); outline-offset: 2px; }}
-  button.ghost {{
-    background: transparent;
-    color: #8a8e97;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
-  }}
-  button.ghost:hover {{
-    color: #d8dadf;
-    background: rgba(255, 255, 255, 0.03);
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
-  }}
-
-  .banner {{
-    padding: 10px 12px;
-    border-radius: 8px;
-    font-size: 12.5px;
+  /* Setup page */
+  .setup {{
+    max-width: 420px;
+    margin: 40px auto;
+    padding: 24px;
     display: flex;
-    align-items: center;
-    gap: 8px;
-    text-wrap: pretty;
+    flex-direction: column;
+    gap: 16px;
+    background: #121317;
+    border-radius: 16px;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.05), 0 16px 40px rgba(0,0,0,0.5);
   }}
-  .banner.ok {{
-    background: rgba(74, 222, 128, 0.09);
-    color: #8fd79e;
-    box-shadow: inset 0 0 0 1px rgba(74, 222, 128, 0.15);
-  }}
-  .banner.err {{
-    background: rgba(239, 68, 68, 0.1);
-    color: #f4a5a5;
-    box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.2);
-  }}
-
-  .qr {{
-    background: #fff;
-    padding: 14px;
-    border-radius: 14px;
-    display: grid;
-    place-items: center;
-    align-self: center;
-    box-shadow:
-      0 0 0 1px rgba(0, 0, 0, 0.1),
-      0 8px 24px rgba(0, 0, 0, 0.3);
-  }}
+  .qr {{ background: #fff; padding: 14px; border-radius: 12px; align-self: center; box-shadow: 0 0 0 1px rgba(0,0,0,0.1), 0 8px 24px rgba(0,0,0,0.3); }}
   .qr svg {{ display: block; width: 180px; height: 180px; }}
-
   code.secret {{
     display: inline-block;
     font: 11px ui-monospace, "SF Mono", Consolas, monospace;
     color: #b5b8bf;
-    background: rgba(255, 255, 255, 0.04);
-    padding: 2px 6px;
+    background: rgba(255,255,255,0.04);
+    padding: 3px 7px;
     border-radius: 5px;
     word-break: break-all;
     user-select: all;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.05);
   }}
-  .setup-hint {{ font-size: 12px; color: #8a8e97; }}
+  .setup-actions {{ display: grid; grid-template-columns: 1fr auto; gap: 8px; }}
 
   @media (prefers-reduced-motion: reduce) {{
-    *, *::before, *::after {{
-      transition-duration: 0.01ms !important;
-      animation-duration: 0.01ms !important;
-    }}
+    *, *::before, *::after {{ transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }}
   }}
 </style>
 </head><body>
@@ -661,15 +600,15 @@ fn render_setup(stream: TcpStream, st: &ServerState, error: Option<&str>) {
         .unwrap_or_default();
 
     let body = format!(
-        r#"<div class="panel">
+        r#"<div class="setup">
   <div>
     <h1>Set up 2FA</h1>
-    <p>Scan the QR with your authenticator app, then enter the current code to lock the controls.</p>
+    <p>Scan the QR with your authenticator app, then enter the current code to finish setup. No code needed for this step — it's just provisioning.</p>
   </div>
   <div class="qr">{svg}</div>
-  <p class="setup-hint">Or type the secret manually: <code class="secret">{secret}</code></p>
+  <p>Or type the secret manually: <code class="secret">{secret}</code></p>
   {err}
-  <form method="POST" action="/setup/verify" class="actions">
+  <form method="POST" action="/setup/verify" class="setup-actions">
     <input class="code" type="text" name="code" inputmode="numeric" pattern="[0-9]{{6}}" maxlength="6" placeholder="000000" autofocus autocomplete="one-time-code" required>
     <button type="submit">Confirm</button>
   </form>
@@ -722,8 +661,41 @@ fn apply_checkbox_state(cfg: &mut config::Config, body: &HashMap<String, String>
     }
 }
 
+fn save_weakens(old: &config::Config, new: &config::Config) -> bool {
+    if old.enabled && !new.enabled {
+        return true;
+    }
+    let old_block_all: HashMap<&str, bool> = old
+        .casinos
+        .iter()
+        .map(|c| (c.id.as_str(), c.blocked_all))
+        .collect();
+    for c in &new.casinos {
+        if old_block_all.get(c.id.as_str()).copied().unwrap_or(false) && !c.blocked_all {
+            return true;
+        }
+    }
+    let old_blocked: HashMap<&str, bool> = old
+        .games
+        .iter()
+        .map(|g| (g.id.as_str(), g.blocked))
+        .collect();
+    for g in &new.games {
+        if old_blocked.get(g.id.as_str()).copied().unwrap_or(false) && !g.blocked {
+            return true;
+        }
+    }
+    false
+}
+
 fn handle_save(stream: TcpStream, st: &ServerState, body: &HashMap<String, String>) {
-    if !verify_code(st, body) {
+    let weakens = {
+        let old = st.cfg.read().unwrap().clone();
+        let mut proposed = old.clone();
+        apply_checkbox_state(&mut proposed, body);
+        save_weakens(&old, &proposed)
+    };
+    if weakens && !verify_code(st, body) {
         redirect(stream, "/?msg=bad_code");
         return;
     }
@@ -736,10 +708,6 @@ fn handle_save(stream: TcpStream, st: &ServerState, body: &HashMap<String, Strin
 }
 
 fn handle_add(stream: TcpStream, st: &ServerState, body: &HashMap<String, String>) {
-    if !verify_code(st, body) {
-        redirect(stream, "/?msg=bad_code");
-        return;
-    }
     let label = body.get("label").map(|s| s.trim()).unwrap_or("").to_string();
     let raw_pattern = body.get("url_pattern").map(|s| s.trim()).unwrap_or("");
     let casino_id = body
@@ -752,7 +720,6 @@ fn handle_add(stream: TcpStream, st: &ServerState, body: &HashMap<String, String
     }
     {
         let mut cfg = st.cfg.write().unwrap();
-        apply_checkbox_state(&mut cfg, body);
 
         let final_pattern = if casino_id.is_empty() {
             config::normalize_pattern(raw_pattern)
@@ -822,11 +789,30 @@ fn handle_remove(stream: TcpStream, st: &ServerState, body: &HashMap<String, Str
     }
     {
         let mut cfg = st.cfg.write().unwrap();
-        apply_checkbox_state(&mut cfg, body);
         cfg.games.retain(|g| g.id != remove_id);
         config::save(&cfg);
     }
     redirect(stream, "/?msg=removed");
+}
+
+fn handle_update(stream: TcpStream, st: &ServerState, body: &HashMap<String, String>) {
+    if !verify_code(st, body) {
+        redirect(stream, "/?msg=bad_code");
+        return;
+    }
+    let has_update = st
+        .update_status
+        .read()
+        .unwrap()
+        .latest_version
+        .is_some();
+    if !has_update {
+        redirect(stream, "/?msg=no_update");
+        return;
+    }
+    updater::apply(st.update_status.clone(), st.stop.clone());
+    let body_html = r#"<div class="setup"><div><h1>Updating</h1><p>Downloading the new version. BetWall will restart in a moment.</p></div></div>"#;
+    respond(stream, 200, "text/html", &page("Updating", body_html));
 }
 
 fn handle_quit(stream: TcpStream, st: &ServerState, body: &HashMap<String, String>) {
@@ -834,7 +820,7 @@ fn handle_quit(stream: TcpStream, st: &ServerState, body: &HashMap<String, Strin
         redirect(stream, "/?msg=bad_code");
         return;
     }
-    let body_html = r#"<div class="panel"><div><h1>Shutting down</h1><p>Tray app is quitting. You can close this tab.</p></div></div>"#;
+    let body_html = r#"<div class="setup"><div><h1>Shutting down</h1><p>Tray app is quitting. You can close this tab.</p></div></div>"#;
     respond(stream, 200, "text/html", &page("Quitting", body_html));
     st.stop.store(true, Ordering::Relaxed);
     thread::spawn(|| {
@@ -843,16 +829,14 @@ fn handle_quit(stream: TcpStream, st: &ServerState, body: &HashMap<String, Strin
     });
 }
 
-fn render_game_row(g: &config::GameEntry, disabled: bool) -> String {
+fn render_game_row(g: &config::GameEntry, muted: bool) -> String {
     let checked = if g.blocked { "checked" } else { "" };
-    let disabled_attr = if disabled { "disabled" } else { "" };
-    let row_class = if disabled { "row muted" } else { "row" };
+    let row_class = if muted { "game muted" } else { "game" };
     let slug = g.url_pattern.rsplit('/').next().unwrap_or(&g.url_pattern);
     format!(
-        r#"<div class="{row_class}"><label class="toggle"><input type="checkbox" name="g_{id}" {checked} {disabled}><span class="name">{label}</span><span class="slug">{slug}</span></label><button type="submit" name="remove_id" value="{id}" formaction="/remove" class="remove" title="Remove" aria-label="Remove {label}">×</button></div>"#,
+        r#"<div class="{row_class}"><label><input type="checkbox" name="g_{id}" {checked}><span class="name">{label}</span><span class="slug">{slug}</span></label><button type="submit" name="remove_id" value="{id}" formaction="/remove" class="rm" title="Remove {label}" aria-label="Remove {label}">×</button></div>"#,
         id = html_escape(&g.id),
         checked = checked,
-        disabled = disabled_attr,
         label = html_escape(&g.label),
         slug = html_escape(slug),
     )
@@ -861,12 +845,14 @@ fn render_game_row(g: &config::GameEntry, disabled: bool) -> String {
 fn render_panel(stream: TcpStream, st: &ServerState, msg: Option<&str>) {
     let cfg = st.cfg.read().unwrap();
     let banner = match msg {
-        Some("setup_ok") => Some(("ok", "2FA locked. Changes require a code.")),
+        Some("setup_ok") => Some(("ok", "2FA active. Pausing and quitting require a code.")),
         Some("ok") => Some(("ok", "Saved.")),
         Some("added") => Some(("ok", "Game added.")),
         Some("removed") => Some(("ok", "Game removed.")),
         Some("bad_input") => Some(("err", "Name and URL pattern are required.")),
-        Some("bad_code") => Some(("err", "Wrong code. Try again.")),
+        Some("bad_code") => Some(("err", "Wrong 2FA code — that action needs one.")),
+        Some("no_update") => Some(("info", "No update available.")),
+        Some("update_err") => Some(("err", "Update failed. Check network and try again.")),
         _ => None,
     };
     let banner_html = banner
@@ -874,33 +860,51 @@ fn render_panel(stream: TcpStream, st: &ServerState, msg: Option<&str>) {
         .unwrap_or_default();
 
     let total_blocked = active_pattern_count(&cfg);
-    let state_sub = if cfg.enabled {
-        format!("<b>{}</b> blocked · monitoring all browsers", total_blocked)
+    let (status_class, status_text) = if cfg.enabled {
+        ("on", "Blocking")
     } else {
-        "Paused — no blocking".to_string()
+        ("off", "Paused")
+    };
+    let state_sub = if cfg.enabled {
+        format!("<b>{total_blocked}</b> pattern{s} active · all browsers monitored",
+            s = if total_blocked == 1 { "" } else { "s" })
+    } else {
+        "Pausing lets everything through. Flip the switch to resume.".to_string()
     };
     let enabled_attr = if cfg.enabled { "checked" } else { "" };
+
+    let update_banner = {
+        let s = st.update_status.read().unwrap();
+        if let Some(v) = &s.latest_version {
+            format!(
+                r#"<div class="banner info"><span>Update available — <b>v{new}</b> (you have v{cur}).</span><button type="submit" formaction="/update" class="warn">Install update</button></div>"#,
+                new = html_escape(v),
+                cur = html_escape(updater::current_version()),
+            )
+        } else {
+            String::new()
+        }
+    };
 
     let mut sections = String::new();
     for c in &cfg.casinos {
         let casino_games: Vec<&config::GameEntry> =
             cfg.games.iter().filter(|g| g.casino == c.id).collect();
+        let total = casino_games.len();
         let blocked_count = casino_games.iter().filter(|g| g.blocked).count();
-        let count_label = if c.blocked_all {
-            "all blocked".to_string()
-        } else if blocked_count > 0 {
-            format!("{blocked_count} blocked")
-        } else if casino_games.is_empty() {
-            "no games".to_string()
+
+        let (pill_class, pill_text) = if c.blocked_all {
+            ("all", "All blocked".to_string())
+        } else if blocked_count == 0 {
+            ("none", if total == 0 { "no games".into() } else { "None".into() })
+        } else if blocked_count == total && total > 0 {
+            ("all", format!("{total} / {total}"))
         } else {
-            format!("{} games", casino_games.len())
+            ("some", format!("{blocked_count} / {total}"))
         };
+
         let checked_all = if c.blocked_all { "checked" } else { "" };
-        let open_attr = if c.blocked_all || blocked_count > 0 {
-            "open"
-        } else {
-            ""
-        };
+        let open_attr = if c.blocked_all || blocked_count > 0 { "open" } else { "" };
 
         let mut rows = String::new();
         for g in &casino_games {
@@ -908,29 +912,34 @@ fn render_panel(stream: TcpStream, st: &ServerState, msg: Option<&str>) {
         }
         if casino_games.is_empty() {
             rows.push_str(
-                r#"<div class="empty">No games yet. Add one with the form below.</div>"#,
+                r#"<div class="empty">No games yet. Add one below.</div>"#,
             );
         }
 
         sections.push_str(&format!(
-            r#"<details class="casino" {open}>
+            r#"<details class="card" {open}>
   <summary>
+    <span class="title"><span class="cname">{label}</span><span class="domain">{domain}</span></span>
+    <span class="pill {pclass}"><span class="pdot"></span>{ptext}</span>
     <span class="chev">▸</span>
-    <span class="cname">{label}</span>
-    <span class="domain">{domain}</span>
-    <span class="count">{count}</span>
-    <label class="allswitch" title="Block all {label}" onclick="event.stopPropagation()">
-      <input type="checkbox" name="c_{id}_all" {checked_all}>
-      <span class="track"><span class="thumb"></span></span>
-    </label>
   </summary>
-  <div class="list">{rows}</div>
+  <div class="card-body">
+    <div class="blockall">
+      <span class="lbl"><b>Block entire casino</b><span>All traffic on {domain}, regardless of game.</span></span>
+      <label class="switch sm" title="Block entire casino">
+        <input type="checkbox" name="c_{id}_all" {checked_all}>
+        <span class="track"><span class="thumb"></span></span>
+      </label>
+    </div>
+    <div class="games">{rows}</div>
+  </div>
 </details>"#,
             open = open_attr,
             id = html_escape(&c.id),
             label = html_escape(&c.label),
             domain = html_escape(&c.domain),
-            count = html_escape(&count_label),
+            pclass = pill_class,
+            ptext = html_escape(&pill_text),
             checked_all = checked_all,
             rows = rows,
         ));
@@ -938,26 +947,36 @@ fn render_panel(stream: TcpStream, st: &ServerState, msg: Option<&str>) {
 
     let custom_games: Vec<&config::GameEntry> =
         cfg.games.iter().filter(|g| g.casino.is_empty()).collect();
-    let mut custom_rows = String::new();
-    for g in &custom_games {
-        custom_rows.push_str(&render_game_row(g, false));
-    }
     let custom_section = if custom_games.is_empty() {
         String::new()
     } else {
+        let blocked_c = custom_games.iter().filter(|g| g.blocked).count();
+        let total_c = custom_games.len();
+        let (pclass, ptext) = if blocked_c == 0 {
+            ("none", "None".to_string())
+        } else if blocked_c == total_c {
+            ("all", format!("{total_c} / {total_c}"))
+        } else {
+            ("some", format!("{blocked_c} / {total_c}"))
+        };
+        let mut rows = String::new();
+        for g in &custom_games {
+            rows.push_str(&render_game_row(g, false));
+        }
         format!(
-            r#"<details class="casino" open>
+            r#"<details class="card" open>
   <summary>
+    <span class="title"><span class="cname">Custom</span><span class="domain">user-added</span></span>
+    <span class="pill {pclass}"><span class="pdot"></span>{ptext}</span>
     <span class="chev">▸</span>
-    <span class="cname">Custom</span>
-    <span class="domain">user-added</span>
-    <span class="count">{count} {word}</span>
   </summary>
-  <div class="list">{rows}</div>
+  <div class="card-body">
+    <div class="games">{rows}</div>
+  </div>
 </details>"#,
-            count = custom_games.len(),
-            word = if custom_games.len() == 1 { "game" } else { "games" },
-            rows = custom_rows,
+            pclass = pclass,
+            ptext = html_escape(&ptext),
+            rows = rows,
         )
     };
 
@@ -971,38 +990,54 @@ fn render_panel(stream: TcpStream, st: &ServerState, msg: Option<&str>) {
     }
 
     let body = format!(
-        r#"<form method="POST" action="/save" class="panel">
-  <div class="head">
-    <div class="info">
-      <h1>BetWall</h1>
-      <div class="sub">{sub}</div>
+        r#"<form method="POST" action="/save">
+  <div class="wrap">
+    <div class="hero">
+      <div class="info">
+        <h1>BetWall <span class="ver">v{ver}</span></h1>
+        <div class="sub">
+          <span class="status {sclass}"><span class="dot"></span>{stext}</span>
+          <span>{sub}</span>
+        </div>
+      </div>
+      <label class="switch" title="Master toggle (turning off requires 2FA)">
+        <input type="checkbox" name="enabled" {enabled}>
+        <span class="track"><span class="thumb"></span></span>
+      </label>
     </div>
-    <label class="switch" title="Master toggle">
-      <input type="checkbox" name="enabled" {enabled}>
-      <span class="track"><span class="thumb"></span></span>
-    </label>
+
+    {update_banner}
+    {banner}
+
+    <h2>Casinos</h2>
+    <div class="casinos">{sections}{custom_section}</div>
+
+    <h2>Add a game</h2>
+    <div class="addbox">
+      <div class="row">
+        <select name="casino" class="select">{casino_options}</select>
+        <input class="input" type="text" name="label" placeholder="Game name (e.g. Dice)" autocomplete="off">
+        <input class="input" type="text" name="url_pattern" placeholder="path or full URL" autocomplete="off">
+        <button type="submit" class="ghost" formaction="/add">Add</button>
+      </div>
+    </div>
   </div>
-  {banner}
-  <div class="casinos">
-    {sections}
-    {custom_section}
-  </div>
-  <div class="add">
-    <select name="casino" class="select">
-      {casino_options}
-    </select>
-    <input type="text" name="label" placeholder="Game name (e.g. Dice)" autocomplete="off">
-    <input type="text" name="url_pattern" placeholder="path or full URL" autocomplete="off">
-    <button type="submit" class="ghost" formaction="/add">Add</button>
-  </div>
-  <div class="actions">
-    <input class="code" type="text" name="code" inputmode="numeric" pattern="[0-9]{{6}}" maxlength="6" placeholder="2FA code" autocomplete="one-time-code" autofocus required>
-    <button type="submit">Save</button>
-    <button type="submit" class="ghost" formaction="/quit">Quit</button>
+
+  <div class="dock">
+    <div class="dock-inner">
+      <span class="hint">2FA only needed to pause, unblock, quit, or install updates.</span>
+      <input class="code" type="text" name="code" inputmode="numeric" pattern="[0-9]{{6}}" maxlength="6" placeholder="2FA" autocomplete="one-time-code">
+      <button type="submit">Save</button>
+      <button type="submit" class="ghost" formaction="/quit">Quit</button>
+    </div>
   </div>
 </form>"#,
+        ver = html_escape(updater::current_version()),
+        sclass = status_class,
+        stext = status_text,
         sub = state_sub,
         enabled = enabled_attr,
+        update_banner = update_banner,
         banner = banner_html,
         sections = sections,
         custom_section = custom_section,

@@ -1,6 +1,6 @@
 [package]
 name = "betwall"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 
 [[bin]]
@@ -25,6 +25,7 @@ hmac = "0.12"
 sha1 = "0.10"
 base32 = "0.5"
 getrandom = "0.2"
+self_update = { version = "0.41", default-features = false, features = ["rustls", "archive-zip", "compression-zip-deflate"] }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"

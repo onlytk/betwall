@@ -3,6 +3,7 @@ use crate::config::{self, SharedConfig};
 use crate::install;
 use crate::monitor;
 use crate::server;
+use crate::updater;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -83,7 +84,10 @@ pub fn run() {
     let cfg: SharedConfig = config::load();
     let stop = Arc::new(AtomicBool::new(false));
 
-    let server_state = server::start(cfg.clone(), stop.clone());
+    let update_status = updater::shared();
+    updater::spawn_checker(update_status.clone(), stop.clone());
+
+    let server_state = server::start(cfg.clone(), stop.clone(), update_status.clone());
     monitor::spawn(cfg.clone(), stop.clone());
 
     let need_setup = !cfg.read().unwrap().setup_complete;
