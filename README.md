@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="tray-icon.png" width="120" alt="BetWall">
+  <img src="tray-icon.svg" width="120" alt="BetWall">
 </p>
 
 <h1 align="center">BetWall</h1>

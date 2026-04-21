@@ -17,12 +17,42 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 fn build_icon() -> tray_icon::Icon {
-    let bytes = include_bytes!("../tray-icon.png");
-    let img = image::load_from_memory(bytes)
-        .expect("decode tray-icon.png")
-        .to_rgba8();
-    let (w, h) = img.dimensions();
-    tray_icon::Icon::from_rgba(img.into_raw(), w, h).expect("icon build")
+    const SIZE: u32 = 64;
+    const RED: [u8; 3] = [201, 44, 44];
+    let center = (SIZE as f32 - 1.0) / 2.0;
+    let outer_r: f32 = 26.0;
+    let inner_r: f32 = 20.0;
+    let bar_hw: f32 = 4.0;
+    let bar_hh: f32 = 24.0;
+    let (sin, cos) = (-std::f32::consts::FRAC_PI_4).sin_cos();
+
+    let mut px = vec![0u8; (SIZE * SIZE * 4) as usize];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let dx = x as f32 - center;
+            let dy = y as f32 - center;
+            let d = (dx * dx + dy * dy).sqrt();
+            let rx = dx * cos - dy * sin;
+            let ry = dx * sin + dy * cos;
+
+            let ring_sd = (d - outer_r).max(inner_r - d);
+            let bar_sd = (rx.abs() - bar_hw)
+                .max(ry.abs() - bar_hh)
+                .max(d - outer_r);
+
+            let ring_cov = (0.5 - ring_sd).clamp(0.0, 1.0);
+            let bar_cov = (0.5 - bar_sd).clamp(0.0, 1.0);
+            let alpha = (ring_cov.max(bar_cov) * 255.0) as u8;
+            if alpha > 0 {
+                let i = ((y * SIZE + x) * 4) as usize;
+                px[i] = RED[0];
+                px[i + 1] = RED[1];
+                px[i + 2] = RED[2];
+                px[i + 3] = alpha;
+            }
+        }
+    }
+    tray_icon::Icon::from_rgba(px, SIZE, SIZE).expect("icon build")
 }
 
 fn open_url(url: &str) {
