@@ -76,6 +76,15 @@ fn fetch_latest() -> Result<Option<String>, String> {
     }
 }
 
+pub fn check_now(status: SharedStatus) -> Result<bool, String> {
+    let latest = fetch_latest()?;
+    let has_update = latest.is_some();
+    let mut s = status.write().unwrap();
+    s.latest_version = latest;
+    s.last_error = None;
+    Ok(has_update)
+}
+
 pub fn apply(status: SharedStatus, stop: Arc<AtomicBool>) {
     thread::spawn(move || {
         status.write().unwrap().applying = true;

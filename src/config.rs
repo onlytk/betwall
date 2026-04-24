@@ -154,6 +154,7 @@ pub fn default_games() -> Vec<GameEntry> {
         ("mines", "Mines"),
         ("crash", "Crash"),
         ("plinko", "Plinko"),
+        ("coinflip", "Coinflip"),
     ];
     for (slug, label) in thrill {
         out.push(GameEntry {
@@ -198,6 +199,18 @@ pub fn load() -> SharedConfig {
         .unwrap_or_else(Config::fresh);
     if cfg.casinos.is_empty() && !cfg.setup_complete {
         cfg.casinos = default_casinos();
+    }
+    let existing_ids: std::collections::HashSet<String> =
+        cfg.games.iter().map(|g| g.id.clone()).collect();
+    let mut changed = false;
+    for g in default_games() {
+        if !existing_ids.contains(&g.id) {
+            cfg.games.push(g);
+            changed = true;
+        }
+    }
+    if changed {
+        save(&cfg);
     }
     Arc::new(RwLock::new(cfg))
 }

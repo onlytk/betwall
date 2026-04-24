@@ -206,6 +206,9 @@ fn handle(stream: TcpStream, st: Arc<ServerState>) {
         ("POST", "/update") => {
             handle_update(stream, &st, &req.body);
         }
+        ("POST", "/check-update") => {
+            handle_check_update(stream, &st);
+        }
         _ => {
             respond(stream, 404, "text/plain", "not found");
         }
@@ -512,7 +515,7 @@ fn page(title: &str, body: &str) -> String {
     border-radius: 14px;
     padding: 10px 12px;
     display: grid;
-    grid-template-columns: 1fr auto auto auto;
+    grid-template-columns: 1fr auto auto auto auto;
     gap: 8px;
     align-items: center;
     box-shadow:
@@ -586,7 +589,11 @@ fn render_setup(stream: TcpStream, st: &ServerState, error: Option<&str>) {
     let secret = pending.clone().unwrap();
     drop(pending);
 
-    let uri = totp::otpauth_url(&secret, "BetWall", "BetWall");
+    let account = std::env::var("USERNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "user".to_string());
+    let uri = totp::otpauth_url(&secret, &account, "BetWall");
     let svg_qr = QrCode::new(uri.as_bytes())
         .expect("qr")
         .render::<svg::Color>()
@@ -795,6 +802,14 @@ fn handle_remove(stream: TcpStream, st: &ServerState, body: &HashMap<String, Str
     redirect(stream, "/?msg=removed");
 }
 
+fn handle_check_update(stream: TcpStream, st: &ServerState) {
+    match updater::check_now(st.update_status.clone()) {
+        Ok(true) => redirect(stream, "/?msg=update_found"),
+        Ok(false) => redirect(stream, "/?msg=up_to_date"),
+        Err(_) => redirect(stream, "/?msg=check_err"),
+    }
+}
+
 fn handle_update(stream: TcpStream, st: &ServerState, body: &HashMap<String, String>) {
     if !verify_code(st, body) {
         redirect(stream, "/?msg=bad_code");
@@ -853,6 +868,9 @@ fn render_panel(stream: TcpStream, st: &ServerState, msg: Option<&str>) {
         Some("bad_code") => Some(("err", "Wrong 2FA code — that action needs one.")),
         Some("no_update") => Some(("info", "No update available.")),
         Some("update_err") => Some(("err", "Update failed. Check network and try again.")),
+        Some("up_to_date") => Some(("ok", "You're on the latest version.")),
+        Some("update_found") => Some(("info", "Update available — see banner below.")),
+        Some("check_err") => Some(("err", "Couldn't reach the update server.")),
         _ => None,
     };
     let banner_html = banner
@@ -1028,6 +1046,7 @@ fn render_panel(stream: TcpStream, st: &ServerState, msg: Option<&str>) {
       <span class="hint">2FA only needed to pause, unblock, quit, or install updates.</span>
       <input class="code" type="text" name="code" inputmode="numeric" pattern="[0-9]{{6}}" maxlength="6" placeholder="2FA" autocomplete="one-time-code">
       <button type="submit">Save</button>
+      <button type="submit" class="ghost" formaction="/check-update" formnovalidate>Check for updates</button>
       <button type="submit" class="ghost" formaction="/quit">Quit</button>
     </div>
   </div>
